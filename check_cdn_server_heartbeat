@@ -1,0 +1,175 @@
+#!/bin/bash
+
+##############################################################################
+# check_cdn_server_heartbeat - Nagios plugin for checking server health      #
+# Author: BlueGrid Platform Engineering                                      #
+#                                                                            #
+# This script checks the operational status of critical infrastructure       #
+# services on different server types (edge, frontend, backend, flex, dns).   #
+#                                                                            #
+# It verifies the dependencies between services                              #
+# (host reachability,database status, routing, HTTP services, DNS resolver)  #
+# to ensure:                                                                 #
+#   - a server is fully ready for production, with all required services     #
+#   - OR, if out of production, critical services are stopped accordingly    #
+#                                                                            #
+# Based on service checks, it returns Nagios-compatible exit codes:          #
+#   0 = OK, 1 = Warning, 2 = Critical, 3 = Unknown                           #
+##############################################################################
+
+# ====== CONFIGURATION ======
+fping_bin=$(which fping)
+mysql_bin=$(which mysql)
+mysqlhost="DB_HOST_HERE"
+mysqluser="DB_USER_HERE"
+mysqlpass="DB_PASS_HERE"
+mysqldb="DB_NAME_HERE"
+
+hostname="$1"
+
+# ====== HELPER FUNCTIONS ======
+
+# Check MySQL 'active' flag for the given hostname
+check_mysql_active() {
+    result=$($mysql_bin -N -B -h "$mysqlhost" -u "$mysqluser" -p"$mysqlpass" "$mysqldb" \
+        -e "SELECT active FROM servers WHERE hostname = '$hostname';")
+    echo "$result"
+}
+
+# Check Bird routing service status via NRPE
+check_bird() {
+    response=$(/usr/local/nagios/libexec/check_nrpe -H "$hostname" -c check_bird)
+    [[ "$response" == *"OK"* ]] && echo 1 || echo 0
+}
+
+# Check Unbound DNS resolver (for DNS servers)
+check_unbound() {
+    response=$(/usr/local/nagios/libexec/check_nrpe -H "$hostname" -c check_unbound)
+    [[ "$response" == *"OK"* ]] && echo 1 || echo 0
+}
+
+# Check if host responds to ping
+check_hostalive() {
+    response=$($fping_bin "$hostname" 2>/dev/null)
+    [[ "$response" == *"alive"* ]] && echo 1 || echo 0
+}
+
+# Check HTTP service (optionally specify port)
+check_http_service() {
+    local port=$1
+    response=$(/usr/local/nagios/libexec/check_http -H "$hostname" ${port:+-p $port})
+    [[ "$response" == *"second response time"* ]] && echo 1 || echo 0
+}
+
+# ====== COMMON CHECKS ======
+
+mysqlalive=$(check_mysql_active)
+bird=$(check_bird)
+hostalive=$(check_hostalive)
+
+# ====== LOGIC PER SERVER TYPE ======
+
+### EDGE SERVERS (edge-*)
+if [[ "$hostname" == edge-* ]]; then
+    nginx_alive=$(check_http_service)
+
+    status="${nginx_alive}${bird}${mysqlalive}${hostalive}"
+
+    # Override if specific conditions met
+    [[ "$hostalive" -eq 0 ]] && status="0000"
+    [[ "$bird" -eq 0 && "$mysqlalive" -eq 0 && "$hostalive" -eq 1 ]] && status="0001"
+    [[ "$bird" -eq 0 && "$mysqlalive" -eq 1 && "$hostalive" -eq 1 ]] && status="0011"
+
+    case "$status" in
+        "0000") echo "Critical - Server unreachable"; exit 2 ;;
+        "0001") echo "Warning - Routing and MySQL inactive"; exit 1 ;;
+        "0011") echo "Critical - Routing inactive, MySQL active"; exit 2 ;;
+        "0101") echo "Critical - Nginx stopped, MySQL inactive"; exit 2 ;;
+        "0111") echo "Critical - Nginx stopped"; exit 2 ;;
+        "1101") echo "Critical - MySQL inactive"; exit 2 ;;
+        "1111") echo "OK - All services running for production"; exit 0 ;;
+        *) echo "Unknown state ($status)"; exit 3 ;;
+    esac
+fi
+
+### FRONTEND SERVERS (frontend-*)
+if [[ "$hostname" == frontend-* ]] || [[ "$hostname" == cdn-frontend-* ]]; then
+    varnish_alive=$(check_http_service)
+    nginx_alive=$(check_http_service 443)
+    http_alive=$((varnish_alive && nginx_alive))
+
+    status="${http_alive}${bird}${mysqlalive}${hostalive}"
+
+    [[ "$hostalive" -eq 0 ]] && status="0000"
+    [[ "$bird" -eq 0 && "$mysqlalive" -eq 0 && "$hostalive" -eq 1 ]] && status="0001"
+    [[ "$bird" -eq 0 && "$mysqlalive" -eq 1 && "$hostalive" -eq 1 ]] && status="0011"
+
+    case "$status" in
+        "0000") echo "Critical - Server unreachable"; exit 2 ;;
+        "0001") echo "Warning - Routing and MySQL inactive"; exit 1 ;;
+        "0011") echo "Critical - Routing inactive, MySQL active"; exit 2 ;;
+        "0101") echo "Critical - HTTP stopped, MySQL inactive"; exit 2 ;;
+        "0111") echo "Critical - HTTP stopped"; exit 2 ;;
+        "1101") echo "Critical - MySQL inactive"; exit 2 ;;
+        "1111") echo "OK - All services running for production"; exit 0 ;;
+        *) echo "Unknown state ($status)"; exit 3 ;;
+    esac
+fi
+
+### BACKEND SERVERS (backend-*)
+if [[ "$hostname" == backend-* ]]; then
+    nginx_alive=$(check_http_service 8088)
+
+    status="${nginx_alive}${mysqlalive}${hostalive}"
+
+    [[ "$hostalive" -eq 0 ]] && status="000"
+
+    case "$status" in
+        "000") echo "Critical - Server unreachable"; exit 2 ;;
+        "001") echo "Warning - Nginx stopped, MySQL inactive"; exit 1 ;;
+        "011") echo "Critical - Nginx stopped"; exit 2 ;;
+        "101") echo "Critical - MySQL inactive"; exit 1 ;;
+        "111") echo "OK - All services running for production"; exit 0 ;;
+        *) echo "Unknown state ($status)"; exit 3 ;;
+    esac
+fi
+
+### FLEX SERVERS (flex-*)
+if [[ "$hostname" == flex-* ]]; then
+    nginx_alive=$(check_http_service)
+
+    status="${nginx_alive}${mysqlalive}${hostalive}"
+
+    [[ "$hostalive" -eq 0 ]] && status="000"
+
+    case "$status" in
+        "000") echo "Critical - Server unreachable"; exit 2 ;;
+        "001") echo "Critical - Nginx stopped, MySQL inactive"; exit 2 ;;
+        "011") echo "Critical - Nginx stopped"; exit 2 ;;
+        "101") echo "Warning - MySQL inactive"; exit 1 ;;
+        "111") echo "OK - All services running for production"; exit 0 ;;
+        *) echo "Unknown state ($status)"; exit 3 ;;
+    esac
+fi
+
+### DNS SERVERS (dns-*)
+if [[ "$hostname" == dns-* ]]; then
+    unbound=$(check_unbound)
+
+    status="${unbound}${bird}${hostalive}"
+
+    [[ "$hostalive" -eq 0 ]] && status="000"
+
+    case "$status" in
+        "000") echo "Critical - Server unreachable"; exit 2 ;;
+        "001") echo "Critical - Routing and Unbound stopped"; exit 2 ;;
+        "011") echo "Critical - Unbound stopped"; exit 2 ;;
+        "101") echo "Critical - Routing stopped"; exit 2 ;;
+        "111") echo "OK - All services running for production"; exit 0 ;;
+        *) echo "Unknown state ($status)"; exit 3 ;;
+    esac
+fi
+
+# Fallback if hostname does not match known patterns
+echo "Unknown hostname pattern: $hostname"
+exit 3
